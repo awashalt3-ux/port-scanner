@@ -1,46 +1,75 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import ipaddress
 import json
+import os
 import re
 import socket
 import ssl
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+
+def _configure_stdio() -> None:
+    # Banners and headers routinely contain non-ASCII bytes; a cp1252 console
+    # would raise UnicodeEncodeError and abort the whole report.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_stdio()
+
 console = Console()
+error_console = Console(stderr=True)
 
 # Common service names, used to label open ports in the output.
 COMMON_PORTS: dict[int, str] = {
     21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
     80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
     445: "SMB", 465: "SMTPS", 587: "SMTP Submission", 993: "IMAPS",
-    995: "POP3S", 1433: "MS SQL", 1521: "Oracle", 3306: "MySQL",
-    3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 6379: "Redis",
-    8080: "HTTP Alt", 8443: "HTTPS Alt", 8888: "HTTP Alt", 27017: "MongoDB",
+    995: "POP3S", 1433: "MS SQL", 1521: "Oracle", 2181: "ZooKeeper",
+    2375: "Docker", 2376: "Docker TLS", 3000: "HTTP Alt", 3306: "MySQL",
+    3389: "RDP", 5000: "HTTP Alt", 5432: "PostgreSQL", 5601: "Kibana",
+    5672: "AMQP", 5900: "VNC", 6379: "Redis", 6443: "Kubernetes API",
+    8000: "HTTP Alt", 8080: "HTTP Alt", 8081: "HTTP Alt", 8443: "HTTPS Alt",
+    8888: "HTTP Alt", 9000: "HTTP Alt", 9090: "HTTP Alt", 9092: "Kafka",
+    9200: "Elasticsearch", 9443: "HTTPS Alt", 10250: "Kubelet",
+    11211: "Memcached", 15672: "RabbitMQ Mgmt", 27017: "MongoDB",
 }
 
-# Ports we probe with an HTTP request; other ports only get a banner read.
-HTTP_PORTS: frozenset[int] = frozenset({80, 443, 8080, 8443, 8888})
-TLS_PORTS: frozenset[int] = frozenset({443, 8443})
+# Ports we probe with an HTTP request; other ports get a banner read first and
+# are retried with an HTTP request when they stay silent (M1).
+HTTP_PORTS: frozenset[int] = frozenset(
+    {80, 443, 3000, 5000, 8000, 8080, 8081, 8443, 8888, 9000, 9090}
+)
+TLS_PORTS: frozenset[int] = frozenset({443, 8443, 9443})
 
 PROBE_CONCURRENCY = 100
 SCAN_CONCURRENCY = 256
 BANNER_IDLE_TIMEOUT = 0.2
 MAX_BANNER_BYTES = 1024
+MAX_HEADER_BYTES = 1 << 20  # 1 MiB: tolerate very large header blocks (H2)
 MAX_HEADER_LINES = 12
 MAX_HEADER_VALUE = 120
 MAX_BANNER_TEXT = 200
+CONNECT_LIMIT = 1 << 20
 
 
 @dataclass
@@ -56,7 +85,10 @@ class ProbeResult:
         return {
             "banner": self.banner or None,
             "http_status": self.http_status or None,
-            "headers": {name: value for name, value in self.headers},
+            # Keep repeated headers (Set-Cookie, WWW-Authenticate, Link, ...).
+            "headers": [
+                {"name": name, "value": value} for name, value in self.headers
+            ],
             "error": self.error or None,
         }
 
@@ -78,12 +110,30 @@ def truncate_header(value: str) -> str:
     return value
 
 
+def to_ascii_host(host: str) -> str:
+    # IDNA-encode internationalised hostnames for DNS, SNI and the Host header.
+    host = host.strip().rstrip(".")
+    if not host:
+        return host
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
+
+
+_TLS_CONTEXT: ssl.SSLContext | None = None
+
+
 def tls_context() -> ssl.SSLContext:
-    # Skip certificate checks: self-signed and internal hosts are common targets.
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+    # Build once and reuse: a scan can open hundreds of TLS connections (L1).
+    global _TLS_CONTEXT
+    if _TLS_CONTEXT is None:
+        # Skip certificate checks: self-signed and internal hosts are common targets.
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _TLS_CONTEXT = ctx
+    return _TLS_CONTEXT
 
 
 async def open_stream(
@@ -93,40 +143,50 @@ async def open_stream(
     timeout: float,
     sni_host: str = "",
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    # Connect by IP, but keep the hostname for TLS SNI.
-    ctx = tls_context() if use_tls else None
-    target = sni_host if use_tls and sni_host else connect_host
+    # Connect by IP, but keep the hostname for TLS SNI (C2).
+    kwargs: dict[str, object] = {"limit": CONNECT_LIMIT}
+    if use_tls:
+        kwargs["ssl"] = tls_context()
+        if sni_host:
+            kwargs["server_hostname"] = sni_host
     return await asyncio.wait_for(
-        asyncio.open_connection(target, port, ssl=ctx), timeout=timeout
+        asyncio.open_connection(connect_host, port, **kwargs), timeout=timeout
     )
 
 
-async def resolve_host(host: str) -> str:
+async def resolve_hosts(host: str) -> list[str]:
     # Resolve once per scan so every port connection does not hit DNS again.
     try:
         ipaddress.ip_address(host)
-        return host
+        return [host]
     except ValueError:
         pass
 
+    ascii_host = to_ascii_host(host)
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except OSError:
-        return host
+        infos = await loop.getaddrinfo(ascii_host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return [host]
 
+    seen: set[str] = set()
+    addresses: list[str] = []
     for info in infos:
         sockaddr = info[4]
-        if sockaddr:
-            return sockaddr[0]
-    return host
+        addr = sockaddr[0] if sockaddr else ""
+        if addr and addr not in seen:
+            seen.add(addr)
+            addresses.append(addr)
+    return addresses or [ascii_host]
 
 
 async def close_stream(writer: asyncio.StreamWriter) -> None:
-    writer.close()
     try:
+        writer.close()
         await writer.wait_closed()
-    except (OSError, ssl.SSLError):
+    except Exception:
+        # Never let cleanup errors mask the scan result (L6, M5). CancelledError
+        # derives from BaseException, so cancellation still propagates.
         pass
 
 
@@ -141,14 +201,15 @@ async def read_banner(reader: asyncio.StreamReader, timeout: float) -> str:
         if remaining <= 0:
             break
         try:
-            byte = await asyncio.wait_for(
-                reader.read(1), timeout=min(BANNER_IDLE_TIMEOUT, remaining)
+            # Read in chunks rather than one byte per wait_for call (L2).
+            chunk = await asyncio.wait_for(
+                reader.read(256), timeout=min(BANNER_IDLE_TIMEOUT, remaining)
             )
         except (asyncio.TimeoutError, OSError):
             break
-        if not byte:
+        if not chunk:
             break
-        chunks.extend(byte)
+        chunks.extend(chunk)
 
     return clean_text(bytes(chunks))
 
@@ -179,23 +240,38 @@ def parse_http_response(raw: bytes) -> tuple[str, list[tuple[str, str]]]:
 
 
 async def read_http_head(reader: asyncio.StreamReader, timeout: float) -> bytes:
-    # Stop as soon as the blank line after the headers arrives.
-    try:
-        return await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
-    except asyncio.IncompleteReadError as exc:
-        return exc.partial
-    except asyncio.LimitOverrunError:
+    # Stop at the first blank line, accepting both CRLF and LF line endings (H1).
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    buf = bytearray()
+
+    while len(buf) < MAX_HEADER_BYTES:
+        if buf.find(b"\r\n\r\n") != -1 or buf.find(b"\n\n") != -1:
+            break
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
         try:
-            return await asyncio.wait_for(reader.read(MAX_BANNER_BYTES), timeout=timeout)
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=remaining)
         except (asyncio.TimeoutError, OSError):
-            return b""
-    except (asyncio.TimeoutError, OSError):
-        return b""
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+
+    crlf = buf.find(b"\r\n\r\n")
+    lf = buf.find(b"\n\n")
+    if crlf != -1 and (lf == -1 or crlf <= lf):
+        return bytes(buf[: crlf + 4])
+    if lf != -1:
+        return bytes(buf[: lf + 2])
+    return bytes(buf)
 
 
 def build_http_request(host: str, port: int) -> str:
     # Minimal request; we only care about the response headers.
-    host_header = f"[{host}]" if ":" in host else host
+    ascii_host = to_ascii_host(host)
+    host_header = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
     if port not in (80, 443):
         host_header += f":{port}"
     return (
@@ -213,7 +289,7 @@ async def probe_http(
 ) -> ProbeResult:
     try:
         reader, writer = await open_stream(
-            connect_host, port, use_tls, timeout, sni_host=host
+            connect_host, port, use_tls, timeout, sni_host=to_ascii_host(host)
         )
     except (OSError, asyncio.TimeoutError, ssl.SSLError) as exc:
         return ProbeResult(port=port, error=type(exc).__name__)
@@ -228,6 +304,9 @@ async def probe_http(
         return ProbeResult(port=port, banner=clean_text(raw))
     except (OSError, asyncio.TimeoutError, ssl.SSLError) as exc:
         return ProbeResult(port=port, error=type(exc).__name__)
+    except UnicodeError as exc:
+        # IDN or other host encoding failure must not abort the batch (H7, M5).
+        return ProbeResult(port=port, error=type(exc).__name__)
     finally:
         await close_stream(writer)
 
@@ -238,7 +317,7 @@ async def grab_banner(
     use_tls = port in TLS_PORTS
     try:
         reader, writer = await open_stream(
-            connect_host, port, use_tls, timeout, sni_host=host
+            connect_host, port, use_tls, timeout, sni_host=to_ascii_host(host)
         )
     except (OSError, asyncio.TimeoutError, ssl.SSLError) as exc:
         return ProbeResult(port=port, error=type(exc).__name__)
@@ -261,20 +340,52 @@ async def probe_port(
     result = await grab_banner(connect_host, host, port, timeout)
     if result.banner.upper().startswith("HTTP/"):
         return await probe_http(connect_host, host, port, port in TLS_PORTS, timeout)
+    if not result.banner and not result.error:
+        # A silent server may be waiting for a request rather than sending a
+        # banner; retry with HTTP so non-standard HTTP ports are detected (M1).
+        http_result = await probe_http(
+            connect_host, host, port, port in TLS_PORTS, timeout
+        )
+        if http_result.http_status or http_result.banner or http_result.error:
+            return http_result
     return result
+
+
+async def probe_ports(
+    host: str, open_ports: dict[int, str], timeout: float
+) -> dict[int, ProbeResult]:
+    # Probe each port on the address that answered the scan.
+    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+    async def bounded(port: int, connect_host: str) -> tuple[int, ProbeResult]:
+        async with sem:
+            try:
+                return port, await probe_port(connect_host, host, port, timeout)
+            except Exception as exc:  # one bad probe must not kill the batch (M5)
+                return port, ProbeResult(
+                    port=port, error=f"{type(exc).__name__}: {exc}"
+                )
+
+    results = await asyncio.gather(
+        *(bounded(port, addr) for port, addr in open_ports.items())
+    )
+    return dict(results)
 
 
 async def probe_all(
     connect_host: str, host: str, ports: list[int], timeout: float
 ) -> dict[int, ProbeResult]:
-    sem = asyncio.Semaphore(PROBE_CONCURRENCY)
+    return await probe_ports(host, {port: connect_host for port in ports}, timeout)
 
-    async def bounded(port: int) -> tuple[int, ProbeResult]:
-        async with sem:
-            return port, await probe_port(connect_host, host, port, timeout)
 
-    results = await asyncio.gather(*(bounded(p) for p in ports))
-    return dict(results)
+def _status_style(status: str) -> str:
+    match = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", status)
+    code = int(match.group(1)) if match else 0
+    if 200 <= code < 300:
+        return "bold green"
+    if 300 <= code < 400:
+        return "bold cyan"
+    return "bold red"
 
 
 def format_probe(result: ProbeResult) -> Text:
@@ -283,8 +394,12 @@ def format_probe(result: ProbeResult) -> Text:
 
     lines: list[Text] = []
     if result.http_status:
-        style = "bold green" if " 200 " in f" {result.http_status} " else "bold yellow"
-        lines.append(Text.assemble(("HTTP  ", "bold"), (result.http_status, style)))
+        lines.append(
+            Text.assemble(
+                ("HTTP  ", "bold"),
+                (result.http_status, _status_style(result.http_status)),
+            )
+        )
         for name, value in result.headers[:MAX_HEADER_LINES]:
             lines.append(Text.assemble((f"{name}: ", "cyan"), (value, "")))
         extra = len(result.headers) - MAX_HEADER_LINES
@@ -330,13 +445,13 @@ def build_payload(
 ) -> dict:
     # JSON export format; ports without a probe result still get an entry.
     entries = []
-    for port in open_ports:
+    for port in sorted(set(open_ports)):
         entry = {
             "port": port,
             "service": COMMON_PORTS.get(port, "unknown"),
             "banner": None,
             "http_status": None,
-            "headers": {},
+            "headers": [],
             "error": None,
         }
         result = probes.get(port)
@@ -347,32 +462,67 @@ def build_payload(
     return {
         "target": host,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
-        "open_port_count": len(open_ports),
+        "open_port_count": len(entries),
         "open_ports": entries,
     }
 
 
-def write_json(path: str, payload: dict) -> None:
+def write_json(path: str, payload: dict) -> bool:
     text = json.dumps(payload, indent=2, ensure_ascii=False)
     if path == "-":
-        print(text)
-        return
+        # Machine-readable output only; never mix in the Rich table (H6).
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+        return True
 
     file = Path(path)
-    file.write_text(text + "\n", encoding="utf-8")
-    console.print(f"[green]JSON written to[/green] {file}")
-
-
-async def scan_port(connect_host: str, port: int, timeout: float = 1.0) -> bool:
-    # A completed TCP handshake means the port is open.
     try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(connect_host, port), timeout=timeout
+        file.parent.mkdir(parents=True, exist_ok=True)  # M2
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=file.name + ".", suffix=".tmp", dir=str(file.parent)
         )
-        await close_stream(writer)
-        return True
-    except (OSError, asyncio.TimeoutError):
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text + "\n")
+            os.replace(tmp_name, file)  # atomic (L7)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+    except OSError as exc:
+        error_console.print(
+            f"[red]Could not write JSON to[/red] {escape(str(file))}: {exc}"
+        )
         return False
+
+    console.print(f"[green]JSON written to[/green] {escape(str(file))}")
+    return True
+
+
+async def scan_port_addr(
+    connect_hosts: str | list[str], port: int, timeout: float = 1.0
+) -> str:
+    # A completed TCP handshake means the port is open; return the winning address.
+    if isinstance(connect_hosts, str):
+        connect_hosts = [connect_hosts]
+    for connect_host in connect_hosts:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(connect_host, port), timeout=timeout
+            )
+        except (OSError, asyncio.TimeoutError):
+            continue
+        except Exception:
+            continue
+        await close_stream(writer)
+        return connect_host
+    return ""
+
+
+async def scan_port(
+    connect_hosts: str | list[str], port: int, timeout: float = 1.0
+) -> bool:
+    return bool(await scan_port_addr(connect_hosts, port, timeout))
 
 
 async def scan(
@@ -381,62 +531,135 @@ async def scan(
     timeout: float = 1.0,
     probe_timeout: float = 2.0,
     do_probe: bool = True,
+    verbose: bool = True,
 ) -> tuple[list[int], dict[int, ProbeResult]]:
-    # Scan every port in parallel, then probe the ones that answered.
-    connect_host = await resolve_host(host)
+    # Resolve every address once, then scan each port across all of them (C1).
+    ascii_host = to_ascii_host(host)
+    connect_hosts = await resolve_hosts(ascii_host)
 
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
 
-    async def bounded(p: int) -> tuple[int, bool]:
+    async def bounded(port: int) -> tuple[int, str]:
         async with sem:
-            return p, await scan_port(connect_host, p, timeout)
+            try:
+                return port, await scan_port_addr(connect_hosts, port, timeout)
+            except Exception:
+                return port, ""
 
-    tasks = [bounded(p) for p in ports]
-    results = await asyncio.gather(*tasks)
-
-    open_ports = sorted([(p, ok) for p, ok in results if ok])
-
-    table = Table(box=None, padding=(0, 2), show_header=False)
-    table.add_column("Status", justify="right", style="bold green")
-    table.add_column("Port", justify="right", style="bold cyan")
-    table.add_column("", style="dim")
-    table.add_column("Service", style="white")
-
-    for p, _ in open_ports:
-        service = COMMON_PORTS.get(p, "unknown")
-        table.add_row("[green]+[/green]", str(p), "/", service)
-
-    summary = Text.assemble(
-        ("  Target: ", "bold"), (host, "bold cyan"), "\n",
-        ("  ", ""), (f"{len(open_ports)}", "bold"),
-        (f" open port{'s' if len(open_ports) != 1 else ''} found\n", ""),
+    results = await asyncio.gather(
+        *(bounded(port) for port in ports), return_exceptions=True
     )
 
-    console.print(Panel(table, title="[bold]Results[/bold]", border_style="cyan", padding=(1, 1)))
-    console.print(summary)
+    open_ports: dict[int, str] = {}
+    for port, outcome in zip(ports, results):
+        if isinstance(outcome, BaseException):
+            continue
+        if outcome[1]:
+            open_ports[port] = outcome[1]
+    open_ports = dict(sorted(open_ports.items()))
+
+    if verbose:
+        table = Table(box=None, padding=(0, 2), show_header=False)
+        table.add_column("Status", justify="right", style="bold green")
+        table.add_column("Port", justify="right", style="bold cyan")
+        table.add_column("", style="dim")
+        table.add_column("Service", style="white")
+
+        for port in open_ports:
+            service = COMMON_PORTS.get(port, "unknown")
+            table.add_row("[green]+[/green]", str(port), "/", service)
+
+        summary = Text.assemble(
+            ("  Target: ", "bold"), (host, "bold cyan"), "\n",
+            ("  ", ""), (str(len(open_ports)), "bold"),
+            (f" open port{'s' if len(open_ports) != 1 else ''} found\n", ""),
+        )
+
+        console.print(
+            Panel(table, title="[bold]Results[/bold]", border_style="cyan", padding=(1, 1))
+        )
+        console.print(summary)
 
     probes: dict[int, ProbeResult] = {}
     if do_probe and open_ports:
-        console.print(
-            f"[bold]Grabbing banners/headers[/bold] "
-            f"[dim]({len(open_ports)} open port{'s' if len(open_ports) != 1 else ''})[/dim]"
-        )
-        probes = await probe_all(
-            connect_host, host, [p for p, _ in open_ports], probe_timeout
-        )
-        print_details(probes)
+        if verbose:
+            console.print(
+                f"[bold]Grabbing banners/headers[/bold] "
+                f"[dim]({len(open_ports)} open port{'s' if len(open_ports) != 1 else ''})[/dim]"
+            )
+        probes = await probe_ports(host, open_ports, probe_timeout)
+        if verbose:
+            print_details(probes)
 
-    return [p for p, _ in open_ports], probes
+    return sorted(open_ports), probes
 
 
 def parse_target(target: str) -> tuple[str, int]:
     # Accept bare hosts; default the port from the URL scheme.
-    if "://" not in target:
-        target = "http://" + target
+    target = target.strip()
+    if not target:
+        raise ValueError("target is empty")
+
+    if target.startswith("//"):
+        target = "http:" + target
+    elif "://" not in target:
+        bare = target.split("/", 1)[0]
+        try:
+            ip = ipaddress.ip_address(bare)
+        except ValueError:
+            target = "http://" + target
+        else:
+            if ip.version == 6:
+                target = f"http://[{bare}]" + target[len(bare):]
+            else:
+                target = "http://" + target
+
     parsed = urlparse(target)
-    host = parsed.hostname or parsed.netloc
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid port in URL: {exc}") from exc
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"could not determine host from {target!r}")
+
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    if not (0 < port <= 65535):
+        raise ValueError(f"port out of range: {port}")
     return host, port
+
+
+def parse_ports(spec: str) -> list[int]:
+    ports: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"empty port in {spec!r}")
+        if "-" in part:
+            bits = part.split("-")
+            if len(bits) != 2 or not bits[0].strip() or not bits[1].strip():
+                raise ValueError(f"bad range {part!r}")
+            try:
+                lo, hi = int(bits[0]), int(bits[1])
+            except ValueError as exc:
+                raise ValueError(f"bad range {part!r}") from exc
+            if lo > hi:
+                raise ValueError(f"reversed range {part!r}")
+        else:
+            try:
+                lo = hi = int(part)
+            except ValueError as exc:
+                raise ValueError(f"invalid port {part!r}") from exc
+        if not (0 < lo <= 65535 and 0 < hi <= 65535):
+            raise ValueError(f"port out of range in {part!r}")
+        ports.update(range(lo, hi + 1))
+
+    if not ports:
+        raise ValueError("no ports specified")
+    return sorted(ports)
 
 
 def main() -> None:
@@ -476,33 +699,53 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    host, default_port = parse_target(args.url)
+    try:
+        host, default_port = parse_target(args.url)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than 0")
+    if args.probe_timeout <= 0:
+        parser.error("--probe-timeout must be greater than 0")
 
     if args.ports:
-        ports = []
-        for part in args.ports.split(","):
-            if "-" in part:
-                lo, hi = map(int, part.split("-"))
-                ports.extend(range(lo, hi + 1))
-            else:
-                ports.append(int(part))
+        try:
+            ports = parse_ports(args.ports)
+        except ValueError as exc:
+            parser.error(str(exc))
     else:
         ports = sorted(COMMON_PORTS)
         if default_port not in ports:
             ports.append(default_port)
+        ports = sorted(set(ports))  # deduplicate (M3)
 
-    console.print(f"\n[bold]Scanning[/bold] [cyan]{host}[/cyan] [dim]({len(ports)} ports)[/dim]")
+    json_stdout = args.json == "-"
+    if not json_stdout:
+        console.print(
+            f"\n[bold]Scanning[/bold] [cyan]{escape(host)}[/cyan] "
+            f"[dim]({len(ports)} ports)[/dim]"
+        )
 
     try:
         open_ports, probes = asyncio.run(
-            scan(host, ports, args.timeout, args.probe_timeout, not args.no_banner)
+            scan(
+                host,
+                ports,
+                args.timeout,
+                args.probe_timeout,
+                not args.no_banner,
+                verbose=not json_stdout,
+            )
         )
     except KeyboardInterrupt:
-        console.print("\n[red]Interrupted[/red]")
+        error_console.print("\n[red]Interrupted[/red]")
         sys.exit(1)
 
-    if args.json:
-        write_json(args.json, build_payload(host, open_ports, probes))
+    if args.json and not write_json(
+        args.json, build_payload(host, open_ports, probes)
+    ):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
