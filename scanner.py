@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Fast async port scanner with banner grabbing and HTTP header inspection."""
 
 import argparse
 import asyncio
@@ -21,6 +20,7 @@ from rich.text import Text
 
 console = Console()
 
+# Common service names, used to label open ports in the output.
 COMMON_PORTS: dict[int, str] = {
     21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
     80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
@@ -30,6 +30,7 @@ COMMON_PORTS: dict[int, str] = {
     8080: "HTTP Alt", 8443: "HTTPS Alt", 8888: "HTTP Alt", 27017: "MongoDB",
 }
 
+# Ports we probe with an HTTP request; other ports only get a banner read.
 HTTP_PORTS: frozenset[int] = frozenset({80, 443, 8080, 8443, 8888})
 TLS_PORTS: frozenset[int] = frozenset({443, 8443})
 
@@ -44,6 +45,7 @@ MAX_BANNER_TEXT = 200
 
 @dataclass
 class ProbeResult:
+    # What we found on one open port: a banner, HTTP headers, or an error.
     port: int
     banner: str = ""
     http_status: str = ""
@@ -60,6 +62,7 @@ class ProbeResult:
 
 
 def clean_text(data: bytes, limit: int = MAX_BANNER_TEXT) -> str:
+    # Banners can contain control characters; keep them printable and short.
     text = data.decode("utf-8", errors="replace")
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -76,6 +79,7 @@ def truncate_header(value: str) -> str:
 
 
 def tls_context() -> ssl.SSLContext:
+    # Skip certificate checks: self-signed and internal hosts are common targets.
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -89,6 +93,7 @@ async def open_stream(
     timeout: float,
     sni_host: str = "",
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    # Connect by IP, but keep the hostname for TLS SNI.
     ctx = tls_context() if use_tls else None
     target = sni_host if use_tls and sni_host else connect_host
     return await asyncio.wait_for(
@@ -97,6 +102,7 @@ async def open_stream(
 
 
 async def resolve_host(host: str) -> str:
+    # Resolve once per scan so every port connection does not hit DNS again.
     try:
         ipaddress.ip_address(host)
         return host
@@ -125,6 +131,7 @@ async def close_stream(writer: asyncio.StreamWriter) -> None:
 
 
 async def read_banner(reader: asyncio.StreamReader, timeout: float) -> str:
+    # Read until the server goes quiet. Silent ports must not block the scan.
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     chunks = bytearray()
@@ -147,6 +154,7 @@ async def read_banner(reader: asyncio.StreamReader, timeout: float) -> str:
 
 
 def parse_http_response(raw: bytes) -> tuple[str, list[tuple[str, str]]]:
+    # Pull out the status line and headers, ignoring any body bytes.
     if not raw:
         return "", []
 
@@ -171,6 +179,7 @@ def parse_http_response(raw: bytes) -> tuple[str, list[tuple[str, str]]]:
 
 
 async def read_http_head(reader: asyncio.StreamReader, timeout: float) -> bytes:
+    # Stop as soon as the blank line after the headers arrives.
     try:
         return await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
     except asyncio.IncompleteReadError as exc:
@@ -185,6 +194,7 @@ async def read_http_head(reader: asyncio.StreamReader, timeout: float) -> bytes:
 
 
 def build_http_request(host: str, port: int) -> str:
+    # Minimal request; we only care about the response headers.
     host_header = f"[{host}]" if ":" in host else host
     if port not in (80, 443):
         host_header += f":{port}"
@@ -244,6 +254,7 @@ async def grab_banner(
 async def probe_port(
     connect_host: str, host: str, port: int, timeout: float
 ) -> ProbeResult:
+    # HTTP ports expect a request first; other ports may send a banner.
     if port in HTTP_PORTS:
         return await probe_http(connect_host, host, port, port in TLS_PORTS, timeout)
 
@@ -317,6 +328,7 @@ def print_details(results: dict[int, ProbeResult]) -> None:
 def build_payload(
     host: str, open_ports: list[int], probes: dict[int, ProbeResult]
 ) -> dict:
+    # JSON export format; ports without a probe result still get an entry.
     entries = []
     for port in open_ports:
         entry = {
@@ -352,6 +364,7 @@ def write_json(path: str, payload: dict) -> None:
 
 
 async def scan_port(connect_host: str, port: int, timeout: float = 1.0) -> bool:
+    # A completed TCP handshake means the port is open.
     try:
         _, writer = await asyncio.wait_for(
             asyncio.open_connection(connect_host, port), timeout=timeout
@@ -369,6 +382,7 @@ async def scan(
     probe_timeout: float = 2.0,
     do_probe: bool = True,
 ) -> tuple[list[int], dict[int, ProbeResult]]:
+    # Scan every port in parallel, then probe the ones that answered.
     connect_host = await resolve_host(host)
 
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
@@ -416,6 +430,7 @@ async def scan(
 
 
 def parse_target(target: str) -> tuple[str, int]:
+    # Accept bare hosts; default the port from the URL scheme.
     if "://" not in target:
         target = "http://" + target
     parsed = urlparse(target)
