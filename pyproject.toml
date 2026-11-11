@@ -4,18 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portscan"
-version = "1.0.0"
-description = "Fast async port scanner with banner and HTTP header inspection"
+version = "1.1.0"
+description = "Fast async port scanner with banner/header inspection and scan modules"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-dependencies = ["rich>=13.0.0"]
+dependencies = ["rich>=13.0.0", "dnspython>=2.4,<3"]
 
 [project.scripts]
 portscan = "scanner:main"
 
 [tool.setuptools]
 py-modules = ["scanner"]
+packages = ["scan_modules"]
 
 [tool.ruff]
 target-version = "py39"

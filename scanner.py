@@ -23,6 +23,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from scan_modules import MODULES, ModuleResult, ScanContext, Target
+from scan_modules.dns_scan import parse_dns_server
+
+__version__ = "1.1.0"
+
 
 def _configure_stdio() -> None:
     # Banners and headers routinely contain non-ASCII bytes; a cp1252 console
@@ -378,6 +383,46 @@ async def probe_all(
     return await probe_ports(host, {port: connect_host for port in ports}, timeout)
 
 
+async def run_modules(
+    host: str,
+    port: int,
+    scheme: str,
+    names: list[str],
+    timeout: float,
+    dns_server: str | None,
+) -> list[ModuleResult]:
+    target = Target(host=host, port=port, scheme=scheme)
+    context = ScanContext(timeout=timeout, dns_server=dns_server)
+    sem = asyncio.Semaphore(10)
+
+    async def run(name: str) -> ModuleResult:
+        async with sem:
+            try:
+                return await MODULES[name].run(target, context)
+            except Exception as exc:  # one bad module must not kill the report
+                return ModuleResult(
+                    name=name,
+                    ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+    results = await asyncio.gather(*(run(name) for name in names))
+    return list(results)
+
+
+def parse_module_names(spec: str) -> list[str]:
+    names = [part.strip().lower() for part in spec.split(",") if part.strip()]
+    if not names:
+        raise ValueError("no modules specified")
+
+    unknown = [name for name in names if name not in MODULES]
+    if unknown:
+        available = ", ".join(sorted(MODULES))
+        raise ValueError(f"unknown module(s): {', '.join(unknown)} (available: {available})")
+
+    return list(dict.fromkeys(names))
+
+
 def _status_style(status: str) -> str:
     match = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", status)
     code = int(match.group(1)) if match else 0
@@ -440,8 +485,35 @@ def print_details(results: dict[int, ProbeResult]) -> None:
     )
 
 
+def print_modules(results: list[ModuleResult]) -> None:
+    if not results:
+        return
+
+    table = Table(box=None, padding=(0, 2), show_header=True, header_style="bold")
+    table.add_column("Module", style="bold cyan")
+    table.add_column("Status", justify="right")
+    table.add_column("Details", overflow="fold")
+
+    for result in results:
+        status = Text("ok", style="green") if result.ok else Text("error", style="red")
+        details = result.error if result.error else result.summary
+        table.add_row(result.name, status, details)
+
+    console.print(
+        Panel(
+            table,
+            title="[bold]Modules[/bold]",
+            border_style="cyan",
+            padding=(1, 1),
+        )
+    )
+
+
 def build_payload(
-    host: str, open_ports: list[int], probes: dict[int, ProbeResult]
+    host: str,
+    open_ports: list[int],
+    probes: dict[int, ProbeResult],
+    modules: list[ModuleResult] | None = None,
 ) -> dict:
     # JSON export format; ports without a probe result still get an entry.
     entries = []
@@ -459,12 +531,15 @@ def build_payload(
             entry.update(result.to_dict())
         entries.append(entry)
 
-    return {
+    payload = {
         "target": host,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
         "open_port_count": len(entries),
         "open_ports": entries,
     }
+    if modules:
+        payload["modules"] = [result.to_dict() for result in modules]
+    return payload
 
 
 def write_json(path: str, payload: dict) -> bool:
@@ -594,7 +669,7 @@ async def scan(
     return sorted(open_ports), probes
 
 
-def parse_target(target: str) -> tuple[str, int]:
+def parse_target(target: str) -> tuple[str, int, str]:
     # Accept bare hosts; default the port from the URL scheme.
     target = target.strip()
     if not target:
@@ -629,7 +704,7 @@ def parse_target(target: str) -> tuple[str, int]:
         port = 443 if parsed.scheme == "https" else 80
     if not (0 < port <= 65535):
         raise ValueError(f"port out of range: {port}")
-    return host, port
+    return host, port, parsed.scheme.lower()
 
 
 def parse_ports(spec: str) -> list[int]:
@@ -664,8 +739,16 @@ def parse_ports(spec: str) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fast async port scanner with banner/header inspection.",
-        usage="python scanner.py <url>",
+        description=(
+            "Fast async port scanner with banner/header inspection and optional "
+            "scan modules."
+        ),
+        usage="python scanner.py <url> [--modules dns,robots]",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument("url", help="Target URL (e.g. https://example.com)")
     parser.add_argument(
@@ -697,10 +780,36 @@ def main() -> None:
         default=None,
         help="Export results as JSON to FILE ('-' for stdout)",
     )
+    parser.add_argument(
+        "--modules",
+        default=None,
+        help="Comma-separated scan modules: dns, robots",
+    )
+    parser.add_argument(
+        "--all-modules",
+        action="store_true",
+        help="Run every available scan module",
+    )
+    parser.add_argument(
+        "--dns-server",
+        default=None,
+        help="DNS resolver for the dns module (IP or [IPv6]:port)",
+    )
+    parser.add_argument(
+        "--module-timeout",
+        type=float,
+        default=5.0,
+        help="Timeout for scan modules in seconds (default: 5.0)",
+    )
+    parser.add_argument(
+        "--skip-port-scan",
+        action="store_true",
+        help="Run scan modules without scanning ports",
+    )
     args = parser.parse_args()
 
     try:
-        host, default_port = parse_target(args.url)
+        host, default_port, scheme = parse_target(args.url)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -708,28 +817,67 @@ def main() -> None:
         parser.error("--timeout must be greater than 0")
     if args.probe_timeout <= 0:
         parser.error("--probe-timeout must be greater than 0")
+    if args.module_timeout <= 0:
+        parser.error("--module-timeout must be greater than 0")
 
-    if args.ports:
+    if args.all_modules and args.modules:
+        parser.error("--all-modules cannot be combined with --modules")
+
+    module_names: list[str] = []
+    if args.all_modules:
+        module_names = list(MODULES)
+    elif args.modules:
         try:
-            ports = parse_ports(args.ports)
+            module_names = parse_module_names(args.modules)
         except ValueError as exc:
             parser.error(str(exc))
-    else:
-        ports = sorted(COMMON_PORTS)
-        if default_port not in ports:
-            ports.append(default_port)
-        ports = sorted(set(ports))  # deduplicate (M3)
+
+    if args.skip_port_scan and not module_names:
+        parser.error("--skip-port-scan requires --modules or --all-modules")
+
+    if args.dns_server and "dns" not in module_names:
+        parser.error("--dns-server requires the dns module")
+
+    if args.dns_server:
+        try:
+            parse_dns_server(args.dns_server)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    ports: list[int] = []
+    if not args.skip_port_scan:
+        if args.ports:
+            try:
+                ports = parse_ports(args.ports)
+            except ValueError as exc:
+                parser.error(str(exc))
+        else:
+            ports = sorted(COMMON_PORTS)
+            if default_port not in ports:
+                ports.append(default_port)
+            ports = sorted(set(ports))  # deduplicate (M3)
 
     json_stdout = args.json == "-"
     if not json_stdout:
+        scope: list[str] = []
+        if not args.skip_port_scan:
+            scope.append(f"{len(ports)} ports")
+        if module_names:
+            plural = "s" if len(module_names) != 1 else ""
+            scope.append(f"{len(module_names)} module{plural}")
         console.print(
             f"\n[bold]Scanning[/bold] [cyan]{escape(host)}[/cyan] "
-            f"[dim]({len(ports)} ports)[/dim]"
+            f"[dim]({', '.join(scope)})[/dim]"
         )
 
-    try:
-        open_ports, probes = asyncio.run(
-            scan(
+    async def run_scan() -> tuple[
+        list[int], dict[int, ProbeResult], list[ModuleResult]
+    ]:
+        open_ports: list[int] = []
+        probes: dict[int, ProbeResult] = {}
+
+        if not args.skip_port_scan:
+            open_ports, probes = await scan(
                 host,
                 ports,
                 args.timeout,
@@ -737,13 +885,36 @@ def main() -> None:
                 not args.no_banner,
                 verbose=not json_stdout,
             )
-        )
+
+        modules: list[ModuleResult] = []
+        if module_names:
+            if not json_stdout:
+                console.print(
+                    "[bold]Running scan modules[/bold] "
+                    f"[dim]({', '.join(module_names)})[/dim]"
+                )
+            modules = await run_modules(
+                host,
+                default_port,
+                scheme,
+                module_names,
+                args.module_timeout,
+                args.dns_server,
+            )
+
+        return open_ports, probes, modules
+
+    try:
+        open_ports, probes, modules = asyncio.run(run_scan())
     except KeyboardInterrupt:
         error_console.print("\n[red]Interrupted[/red]")
         sys.exit(1)
 
+    if not json_stdout:
+        print_modules(modules)
+
     if args.json and not write_json(
-        args.json, build_payload(host, open_ports, probes)
+        args.json, build_payload(host, open_ports, probes, modules)
     ):
         sys.exit(1)
 
